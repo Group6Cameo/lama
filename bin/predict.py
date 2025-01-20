@@ -36,32 +36,58 @@ LOGGER = logging.getLogger(__name__)
 
 @hydra.main(config_path='../configs/prediction', config_name='default.yaml')
 def main(predict_config: OmegaConf):
+    return process_predict(predict_config)
+
+
+def process_predict(predict_config: OmegaConf, preloaded_model=None, preloaded_device=None):
     try:
         if sys.platform != 'win32':
             # kill -10 <pid> will result in traceback dumped into log
             register_debug_signal_handlers()
 
-        device_name = "cuda" if torch.cuda.is_available() else "cpu"
-        device = torch.device(device_name)
+        if preloaded_model is not None and preloaded_device is not None:
+            model = preloaded_model
+            device = preloaded_device
+            device_name = device.type  # Get device name from the device object
+            print("Using preloaded model and device")
+        else:
+            print("Loading model and configuration")
+            # Only load model and configuration if not preloaded
+            device_name = "cuda" if torch.cuda.is_available() else "cpu"
+            device = torch.device(device_name)
 
-        train_config_path = os.path.join(
-            predict_config.model.path, 'config.yaml')
-        with open(train_config_path, 'r') as f:
-            train_config = OmegaConf.create(yaml.safe_load(f))
+            train_config_path = os.path.join(
+                predict_config.model.path, 'config.yaml')
+            with open(train_config_path, 'r') as f:
+                train_config = OmegaConf.create(yaml.safe_load(f))
 
-        train_config.training_model.predict_only = True
-        train_config.visualizer.kind = 'noop'
+            train_config.training_model.predict_only = True
+            train_config.visualizer.kind = 'noop'
+
+            checkpoint_path = os.path.join(
+                predict_config.model.path, 'models', predict_config.model.checkpoint)
+            model = load_checkpoint(
+                train_config, checkpoint_path, strict=False, map_location=device_name)
+            model.freeze()
+            model.to(device)
+
+        # Add check for number of available GPUs
+        if device_name == "cuda":
+            num_gpus = torch.cuda.device_count()
+            if num_gpus == 0:
+                device_name = "cpu"
+                device = torch.device(device_name)
+            LOGGER.info(f"Found {num_gpus} GPU(s)")
 
         out_ext = predict_config.get('out_ext', '.png')
 
-        checkpoint_path = os.path.join(predict_config.model.path,
-                                       'models',
-                                       predict_config.model.checkpoint)
-        model = load_checkpoint(
-            train_config, checkpoint_path, strict=False, map_location=device_name)
-        model.freeze()
         if not predict_config.get('refine', False):
-            model.to(device)
+            pass  # Model is already on the correct device
+        else:
+            # Pass device information through existing configuration structure
+            if 'device_ids' in predict_config.refiner:
+                predict_config.refiner.device_ids = [
+                    0] if device.type == "cuda" else None
 
         if not predict_config.indir.endswith('/'):
             predict_config.indir += '/'
@@ -81,6 +107,7 @@ def main(predict_config: OmegaConf):
                 assert 'unpad_to_size' in batch, "Unpadded size is required for the refinement"
                 # image unpadding is taken care of in the refiner, so that output image
                 # is same size as the input image
+                batch = move_to_device(batch, device)
                 cur_res = refine_predict(
                     batch, model, **predict_config.refiner)
                 cur_res = cur_res[0].permute(1, 2, 0).detach().cpu().numpy()
